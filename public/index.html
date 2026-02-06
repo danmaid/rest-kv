@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>rest-kv UI</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans JP', Arial; padding: 20px; max-width:1200px; margin:auto }
+    header { display:flex; gap:12px; align-items:center; margin-bottom:16px }
+    input[type=text] { padding:6px 8px; font-size:14px }
+    button { padding:6px 10px; font-size:14px }
+    table { width:100%; border-collapse:collapse; margin-top:12px }
+    th,td { border:1px solid #ddd; padding:8px; vertical-align:top }
+    th { background:#f6f8fa; text-align:left }
+    pre { background:#f6f8fa; padding:8px; border-radius:6px; white-space:pre-wrap; word-break:break-word }
+    .controls { display:flex; gap:8px; align-items:center }
+    .actions button { margin-right:6px }
+    .editor { margin-top:12px }
+    .muted { color:#666; font-size:13px }
+    .error { color:crimson }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 style="margin:0">rest-kv</h1>
+    <div class="controls">
+      <label class="muted">Collection:</label>
+      <input id="collection" type="text" placeholder="example" value="default" />
+      <button id="load">Load</button>
+      <button id="refresh">Refresh</button>
+      <button id="createCollection">Create</button>
+      <button id="deleteCollection">Delete</button>
+      <button id="openapi">OpenAPI</button>
+    </div>
+  </header>
+
+  <section>
+    <h2 style="margin-top:6px">Collections</h2>
+    <div style="display:flex;gap:12px;align-items:center;">
+      <div style="flex:1">
+        <table id="collectionsTable">
+          <thead><tr><th>Name</th><th style="width:160px">Actions</th></tr></thead>
+          <tbody id="collectionsTbody"></tbody>
+        </table>
+      </div>
+      <div style="width:260px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="newCollectionName" placeholder="new collection" style="flex:1;padding:6px" />
+          <button id="createCollectionInline">Create</button>
+        </div>
+        <div style="margin-top:8px"><button id="refreshCollections">Refresh list</button></div>
+      </div>
+    </div>
+
+    <hr style="margin:12px 0">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h2 style="margin:0">Items</h2>
+      <div>
+        <button id="new">New Item</button>
+      </div>
+    </div>
+
+    <div id="message" class="muted">未ロード</div>
+
+    <table id="table" hidden>
+      <thead>
+        <tr><th style="width:20%">ID</th><th>Value</th><th style="width:20%">Actions</th></tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </section>
+
+  <section class="editor" id="editorSection" hidden>
+    <h3 id="editorTitle">Editor</h3>
+    <div id="editorMsg" class="muted"></div>
+    <textarea id="editor" style="width:100%;height:200px;margin-top:8px;font-family:monospace;font-size:13px"></textarea>
+    <div style="margin-top:8px">
+      <button id="save">Save</button>
+      <button id="patch">Patch</button>
+      <button id="cancel">Cancel</button>
+      <span id="editorError" class="error"></span>
+    </div>
+  </section>
+
+  <script>
+    const base = location.pathname.replace(/\/$/, '');
+    const collectionInput = document.getElementById('collection');
+    const loadBtn = document.getElementById('load');
+    const refreshBtn = document.getElementById('refresh');
+    const openapiBtn = document.getElementById('openapi');
+    const newBtn = document.getElementById('new');
+    const message = document.getElementById('message');
+    const table = document.getElementById('table');
+    const tbody = document.getElementById('tbody');
+    const editorSection = document.getElementById('editorSection');
+    const editor = document.getElementById('editor');
+    const editorTitle = document.getElementById('editorTitle');
+    const editorMsg = document.getElementById('editorMsg');
+    const saveBtn = document.getElementById('save');
+    const patchBtn = document.getElementById('patch');
+    const cancelBtn = document.getElementById('cancel');
+    const editorError = document.getElementById('editorError');
+
+    let currentCollection = collectionInput.value || 'default';
+    let collectionEtag = null;
+    let editing = null; // {id: string|null, isNew:bool}
+
+    function apiUrl(path) { 
+      const fullUrl = `${base}/${path}`;
+      console.log('apiUrl:', path, '->', fullUrl);
+      return fullUrl; 
+    }
+
+    function setMessage(text) { message.textContent = text; }
+
+    async function loadCollection(name) {
+      currentCollection = name;
+      setMessage('Loading...');
+      tbody.innerHTML = '';
+      table.hidden = true;
+      try {
+        const url = apiUrl(encodeURIComponent(name)) + '?limit=100';
+        const resp = await fetch(url, { headers: { Accept: 'application/json' } });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const json = await resp.json();
+        collectionEtag = resp.headers.get('ETag');
+        renderItems(json.data || []);
+        setMessage(`Loaded ${json.data.length} items.`);
+      } catch (e) {
+        setMessage('Load failed: ' + String(e));
+      }
+    }
+
+    function renderItems(items) {
+      tbody.innerHTML = '';
+      if (!items || items.length === 0) {
+        setMessage('No items');
+        return;
+      }
+      table.hidden = false;
+      for (const it of items) {
+        const tr = document.createElement('tr');
+        const idTd = document.createElement('td');
+        idTd.textContent = it.id;
+        const valTd = document.createElement('td');
+        const pre = document.createElement('pre');
+        try { pre.textContent = JSON.stringify(({...it, id: undefined}), null, 2); } catch { pre.textContent = String(it.value ?? '') }
+        valTd.appendChild(pre);
+        const actionsTd = document.createElement('td');
+        actionsTd.className = 'actions';
+        const viewBtn = document.createElement('button'); viewBtn.textContent = 'View';
+        const editBtn = document.createElement('button'); editBtn.textContent = 'Edit';
+        const delBtn = document.createElement('button'); delBtn.textContent = 'Delete';
+        actionsTd.appendChild(viewBtn); actionsTd.appendChild(editBtn); actionsTd.appendChild(delBtn);
+
+        viewBtn.addEventListener('click', () => {
+          openViewer(it.id);
+        });
+
+        editBtn.addEventListener('click', () => {
+          openEditor(it.id, false);
+        });
+
+        delBtn.addEventListener('click', async () => {
+          if (!confirm('Delete item ' + it.id + '?')) return;
+          try {
+            const resp = await fetch(apiUrl(encodeURIComponent(currentCollection) + '/' + encodeURIComponent(it.id)), { method: 'DELETE' });
+            if (resp.status === 404) throw new Error('Not found');
+            if (!resp.ok && resp.status !== 204) throw new Error('HTTP ' + resp.status);
+            setMessage('Deleted. Refreshing...');
+            await loadCollection(currentCollection);
+          } catch (e) { setMessage('Delete failed: ' + String(e)); }
+        });
+
+        tr.appendChild(idTd); tr.appendChild(valTd); tr.appendChild(actionsTd);
+        tbody.appendChild(tr);
+      }
+    }
+
+    function openViewer(id) {
+      openEditor(id, true);
+      saveBtn.hidden = true; patchBtn.hidden = true; cancelBtn.hidden = false;
+    }
+
+    async function openEditor(id, readOnly) {
+      editorError.textContent = '';
+      editorSection.hidden = false;
+      editing = { id: id ?? null, isNew: id == null };
+      if (id) {
+        editorTitle.textContent = 'Edit: ' + id;
+        editorMsg.textContent = 'Fetching item...';
+        try {
+          const resp = await fetch(apiUrl(encodeURIComponent(currentCollection) + '/' + encodeURIComponent(id)));
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const json = await resp.json();
+          editor.value = JSON.stringify(json.value ?? (() => { const o = {...json}; delete o.id; return o })(), null, 2);
+          editorMsg.textContent = 'ETag: ' + (resp.headers.get('ETag') || '');
+        } catch (e) { editorError.textContent = 'Fetch failed: ' + String(e); }
+      } else {
+        editorTitle.textContent = 'New Item';
+        editor.value = '{}';
+        editorMsg.textContent = '';
+      }
+      saveBtn.hidden = false; patchBtn.hidden = false; cancelBtn.hidden = false;
+    }
+
+    cancelBtn.addEventListener('click', () => { editorSection.hidden = true; editing = null; editorError.textContent = ''; });
+
+    saveBtn.addEventListener('click', async () => {
+      await submitEditor(false);
+    });
+    patchBtn.addEventListener('click', async () => {
+      await submitEditor(true);
+    });
+
+    async function submitEditor(patch) {
+      editorError.textContent = '';
+      let parsed;
+      try { parsed = JSON.parse(editor.value); } catch (e) { editorError.textContent = 'Invalid JSON'; return; }
+      if (!editing) return;
+      if (editing.isNew) {
+        // POST
+        try {
+          const resp = await fetch(apiUrl(encodeURIComponent(currentCollection)), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(parsed) });
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          editorSection.hidden = true; setMessage('Created. Refreshing...'); await loadCollection(currentCollection);
+        } catch (e) { editorError.textContent = 'Create failed: ' + String(e); }
+        return;
+      }
+
+      const id = editing.id;
+      try {
+        // fetch item to get current ETag
+        const headResp = await fetch(apiUrl(encodeURIComponent(currentCollection) + '/' + encodeURIComponent(id)));
+        if (!headResp.ok) throw new Error('HTTP ' + headResp.status);
+        const etag = headResp.headers.get('ETag');
+
+        const method = patch ? 'PATCH' : 'PUT';
+        const resp = await fetch(apiUrl(encodeURIComponent(currentCollection) + '/' + encodeURIComponent(id)), { method, headers: { 'Content-Type': 'application/json', 'If-Match': etag || '' }, body: JSON.stringify(parsed) });
+        if (resp.status === 409) throw new Error('Conflict (ETag mismatch)');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        editorSection.hidden = true; setMessage('Saved. Refreshing...'); await loadCollection(currentCollection);
+      } catch (e) { editorError.textContent = 'Save failed: ' + String(e); }
+    }
+
+    newBtn.addEventListener('click', () => { editing = { id: null, isNew: true }; openEditor(null, false); });
+
+    loadBtn.addEventListener('click', async () => { await loadCollection(collectionInput.value.trim() || 'default'); });
+    refreshBtn.addEventListener('click', async () => { await loadCollection(currentCollection); });
+
+    openapiBtn.addEventListener('click', async () => {
+      try {
+        const resp = await fetch(base + '/openapi.json');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const json = await resp.json();
+        const text = JSON.stringify(json, null, 2);
+        const win = window.open('', '_blank');
+        win.document.title = 'openapi.json';
+        const pre = win.document.createElement('pre');
+        pre.textContent = text; win.document.body.appendChild(pre);
+      } catch (e) { alert('OpenAPI fetch failed: ' + e); }
+    });
+
+    // Collections list
+    const collectionsTbody = document.getElementById('collectionsTbody');
+    const refreshCollectionsBtn = document.getElementById('refreshCollections');
+    const newCollectionName = document.getElementById('newCollectionName');
+    const createCollectionInline = document.getElementById('createCollectionInline');
+
+    async function loadCollections() {
+      try {
+        const fetchUrl = base + '/_collections';
+        console.log('loadCollections fetching from:', fetchUrl);
+        const resp = await fetch(fetchUrl);
+        console.log('Response status:', resp.status);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const json = await resp.json();
+        console.log('API response:', json);
+
+        let collections = [];
+        if (Array.isArray(json.collections)) {
+          collections = json.collections;
+        } else if (Array.isArray(json.data)) {
+          // Support legacy/alternate shape where server returned items for a special collection
+          collections = json.data.map((it) => {
+            if (typeof it === 'string') return it;
+            if (it && typeof it === 'object') return it.name ?? it.id ?? null;
+            return null;
+          }).filter(Boolean);
+        }
+
+        console.log('Derived collections list:', collections);
+        renderCollections(collections || []);
+      } catch (e) { console.warn('loadCollections failed', e); }
+    }
+
+    function renderCollections(list) {
+      console.log('renderCollections called with:', list, 'length:', list ? list.length : 0);
+      collectionsTbody.innerHTML = '';
+      if (!list || list.length === 0) {
+        console.log('No collections, showing placeholder');
+        const tr = document.createElement('tr');
+        const td = document.createElement('td'); td.colSpan = 2; td.textContent = '(no collections)'; tr.appendChild(td); collectionsTbody.appendChild(tr); return;
+      }
+      for (const name of list) {
+        const tr = document.createElement('tr');
+        const tdName = document.createElement('td'); tdName.textContent = name; tdName.style.cursor = 'pointer';
+        tdName.addEventListener('click', () => { collectionInput.value = name; loadCollection(name); });
+        const tdAct = document.createElement('td');
+        const loadBtn2 = document.createElement('button'); loadBtn2.textContent = 'Load';
+        const delBtn2 = document.createElement('button'); delBtn2.textContent = 'Delete';
+        loadBtn2.addEventListener('click', () => { collectionInput.value = name; loadCollection(name); });
+        delBtn2.addEventListener('click', async () => {
+          if (!confirm('Delete collection "' + name + '" and all items?')) return;
+          try {
+            const resp = await fetch(base + '/_collections/' + encodeURIComponent(name), { method: 'DELETE' });
+            if (resp.status === 404) { setMessage('Not found'); return; }
+            if (!resp.ok && resp.status !== 204) throw new Error('HTTP ' + resp.status);
+            setMessage('Deleted collection ' + name);
+            await loadCollections();
+            if (collectionInput.value === name) { tbody.innerHTML = ''; table.hidden = true; }
+          } catch (e) { setMessage('Delete failed: ' + e); }
+        });
+        tdAct.appendChild(loadBtn2); tdAct.appendChild(delBtn2);
+        tr.appendChild(tdName); tr.appendChild(tdAct); collectionsTbody.appendChild(tr);
+      }
+    }
+
+    refreshCollectionsBtn.addEventListener('click', loadCollections);
+    createCollectionInline.addEventListener('click', async () => {
+      const name = (newCollectionName.value || '').trim(); if (!name) { alert('enter name'); return; }
+      if (!confirm('Create "' + name + '"?')) return;
+      try {
+        const resp = await fetch(base + '/_collections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        newCollectionName.value = '';
+        await loadCollections();
+      } catch (e) { setMessage('Create failed: ' + e); }
+    });
+
+    // Hide old-style create/delete buttons in header
+    document.getElementById('createCollection').style.display = 'none';
+    document.getElementById('deleteCollection').style.display = 'none';
+
+    // Initial load: fetch collections list and load default collection
+    (async () => { await loadCollections(); await loadCollection(currentCollection); })();
+  </script>
+</body>
+</html>

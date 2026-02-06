@@ -14,6 +14,7 @@ const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const BASE_PATH = "/v1/data";
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
+const PUBLIC_DIR = path.join(process.cwd(), "public");
 
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 1_000_000); // 1MB
 const ENABLE_CORS = (process.env.CORS ?? "1") === "1";
@@ -156,6 +157,44 @@ function pickQueryInt(u: URL, key: string, def: number, min: number, max: number
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+function generateOpenApi(host: string) {
+  const serverUrl = `http://${host}`;
+  return {
+    openapi: "3.0.3",
+    info: { title: "rest-kv", version: "0.1.0", description: "Simple key-value REST API" },
+    servers: [{ url: serverUrl }],
+    paths: {
+      [`${BASE_PATH}/_collections`]: {
+        get: { summary: "List collections", responses: { "200": { description: "OK" } } },
+        post: { summary: "Create collection", requestBody: { content: { "application/json": { schema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } } } }, responses: { "201": { description: "Created" } } },
+      },
+      [`${BASE_PATH}/_collections/{collection}`]: {
+        delete: { summary: "Delete collection", parameters: [{ name: "collection", in: "path", required: true, schema: { type: "string" } }], responses: { "204": { description: "No Content" }, "404": { description: "Not found" } } },
+      },
+      [`${BASE_PATH}/{collection}`]: {
+        get: {
+          summary: "List items in a collection",
+          parameters: [
+            { name: "collection", in: "path", required: true, schema: { type: "string" } },
+            { name: "limit", in: "query", schema: { type: "integer" } },
+            { name: "offset", in: "query", schema: { type: "integer" } },
+            { name: "q", in: "query", schema: { type: "string" } },
+          ],
+          responses: { "200": { description: "OK" } },
+        },
+        post: { summary: "Create item", parameters: [{ name: "collection", in: "path", required: true, schema: { type: "string" } }], responses: { "201": { description: "Created" } } },
+      },
+      [`${BASE_PATH}/{collection}/{id}`]: {
+        get: { summary: "Get item", parameters: [{ name: "collection", in: "path", required: true }, { name: "id", in: "path", required: true }], responses: { "200": { description: "OK" }, "404": { description: "Not found" } } },
+        put: { summary: "Replace item", parameters: [{ name: "collection", in: "path", required: true }, { name: "id", in: "path", required: true }], responses: { "200": { description: "OK" }, "201": { description: "Created" } } },
+        patch: { summary: "Patch item", parameters: [{ name: "collection", in: "path", required: true }, { name: "id", in: "path", required: true }], responses: { "200": { description: "OK" }, "201": { description: "Created" } } },
+        delete: { summary: "Delete item", parameters: [{ name: "collection", in: "path", required: true }, { name: "id", in: "path", required: true }], responses: { "204": { description: "No Content" } } },
+      },
+    },
+    components: { schemas: { JsonValue: { description: "Arbitrary JSON value" } } },
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     addCors(res);
@@ -175,7 +214,91 @@ const server = http.createServer(async (req, res) => {
     }
 
     const rest = url.pathname.slice(BASE_PATH.length).replace(/^\/+/, "");
+    // Collection management endpoints: /v1/data/_collections (check FIRST before item operations)
+    if (rest === "_collections" || rest.startsWith("_collections/")) {
+      const sub = rest.slice("_collections".length).replace(/^\/+/, "");
+      // list or create collections
+      if (!sub) {
+        if (req.method === "GET") {
+          await ensureDataDir();
+          const files = await fs.readdir(DATA_DIR);
+          const collections = files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5));
+          json(res, 200, { collections });
+          return;
+        }
+
+        if (req.method === "POST") {
+          const raw = await readBody(req).catch((e) => {
+            if (String(e?.message) === "payload_too_large") {
+              json(res, 413, { error: "payload_too_large", maxBytes: MAX_BODY_BYTES });
+              return null;
+            }
+            throw e;
+          });
+          if (raw === null) return;
+
+          let body: any;
+          try { body = JSON.parse(raw); } catch { return badRequest(res, "invalid JSON"); }
+          const name = typeof body?.name === 'string' ? sanitizeCollectionName(body.name) : null;
+          if (!name) return badRequest(res, 'invalid collection name (allowed: A-Z a-z 0-9 . _ -)');
+
+          await ensureDataDir();
+          const p = collectionFilePath(name);
+          try {
+            await fs.stat(p);
+            return badRequest(res, 'collection already exists');
+          } catch (e: any) {
+            if (e?.code !== 'ENOENT') throw e;
+          }
+
+          const data: CollectionFile = { items: {}, updatedAt: Date.now() };
+          await writeCollectionAtomic(name, data);
+          json(res, 201, { name }, { Location: `${BASE_PATH}/${encodeURIComponent(name)}` });
+          return;
+        }
+
+        return methodNotAllowed(res, ["GET", "POST", "OPTIONS"]);
+      }
+
+      // sub is collection name for actions like DELETE
+      const collectionName = decodeURIComponent(sub);
+      const collection = sanitizeCollectionName(collectionName);
+      if (!collection) return badRequest(res, 'invalid collection name (allowed: A-Z a-z 0-9 . _ -)');
+
+      if (req.method === 'DELETE') {
+        await ensureDataDir();
+        const p = collectionFilePath(collection);
+        try {
+          await fs.unlink(p);
+          noContent(res, 204);
+          return;
+        } catch (e: any) {
+          if (e?.code === 'ENOENT') return notFound(res);
+          throw e;
+        }
+      }
+
+      return methodNotAllowed(res, ['DELETE', 'OPTIONS']);
+    }
+    // Serve OpenAPI JSON for the browser UI
+    if (url.pathname === `${BASE_PATH}/openapi.json`) {
+      const openapi = generateOpenApi(host);
+      json(res, 200, openapi);
+      return;
+    }
     if (!rest) {
+      const accept = String(req.headers.accept ?? "");
+      if (accept.includes("text/html")) {
+        try {
+          const index = await fs.readFile(path.join(PUBLIC_DIR, "index.html"), "utf8");
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(index);
+          return;
+        } catch (e: any) {
+          // If index.html not found, fall back to JSON description
+        }
+      }
+
       json(res, 200, {
         name: "rest-kv",
         basePath: BASE_PATH,
